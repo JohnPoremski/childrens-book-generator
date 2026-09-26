@@ -24,14 +24,22 @@ import re
 import threading
 import time
 import uuid
+from io import BytesIO
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from openai import OpenAI
+from PIL import Image as PILImage
 from pydantic import BaseModel, Field
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.platypus import Image as RLImage
+from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
 
 load_dotenv("env.txt", override=True)
 assert os.environ.get("OPENAI_API_KEY"), "OPENAI_API_KEY not set — check env.txt has an 'OPENAI_API_KEY=' line"
@@ -233,6 +241,67 @@ def get_image(book_id: str, filename: str):
     return FileResponse(path)
 
 
+def _build_pdf(data: dict, images_dir: Path) -> bytes:
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.75 * inch, bottomMargin=0.75 * inch)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "BookTitle", parent=styles["Title"], alignment=TA_CENTER, fontSize=28, spaceAfter=20
+    )
+    subtitle_style = ParagraphStyle("BookSubtitle", parent=styles["Normal"], alignment=TA_CENTER, fontSize=13)
+    text_style = ParagraphStyle(
+        "PageText", parent=styles["Normal"], alignment=TA_CENTER, fontSize=14, leading=20, spaceBefore=16
+    )
+    label_style = ParagraphStyle("MoralLabel", parent=styles["Heading2"], alignment=TA_CENTER)
+    moral_style = ParagraphStyle("Moral", parent=styles["Italic"], alignment=TA_CENTER, fontSize=16, leading=22)
+
+    flowables = [
+        Spacer(1, 2 * inch),
+        Paragraph(data["title"], title_style),
+        Spacer(1, 0.3 * inch),
+        Paragraph(f"A story about {data['character_name']}", subtitle_style),
+        PageBreak(),
+    ]
+
+    max_width, max_height = 6.0 * inch, 5.0 * inch
+    for page in data["pages"]:
+        if not page.get("image_failed") and page.get("image_file"):
+            img_path = images_dir / page["image_file"]
+            with PILImage.open(img_path) as im:
+                w, h = im.size
+            scale = min(max_width / w, max_height / h)
+            image = RLImage(str(img_path), width=w * scale, height=h * scale)
+            image.hAlign = "CENTER"
+            flowables.append(image)
+        flowables.append(Paragraph(page["page_text"], text_style))
+        flowables.append(PageBreak())
+
+    flowables.append(Spacer(1, 2 * inch))
+    flowables.append(Paragraph("The moral of the story:", label_style))
+    flowables.append(Paragraph(data["moral"], moral_style))
+
+    doc.build(flowables)
+    return buf.getvalue()
+
+
+@app.get("/books/{book_id}/download")
+def download_book(book_id: str):
+    if not book_id.isalnum():
+        raise HTTPException(404, "unknown book_id")
+    book_dir = DATA_DIR / book_id
+    story_path = book_dir / "story.json"
+    if not story_path.exists():
+        raise HTTPException(404, "unknown book_id")
+    data = json.loads(story_path.read_text())
+    pdf_bytes = _build_pdf(data, book_dir / "images")
+    safe_title = re.sub(r"[^A-Za-z0-9 _-]", "", data["title"]).strip() or "book"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{safe_title}.pdf"'},
+    )
+
+
 HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -309,6 +378,16 @@ HTML_PAGE = """
   }
   button:hover { background: var(--accent-dark); }
   button:disabled { background: var(--muted); cursor: not-allowed; }
+  .secondary-btn {
+    margin-top: 0;
+    width: auto;
+    background: transparent;
+    color: var(--accent-dark);
+    border: 1px solid var(--accent);
+    padding: 8px 14px;
+    font-size: 0.85rem;
+  }
+  .secondary-btn:hover { background: var(--bg); color: var(--accent-dark); }
   #progress { margin-top: 16px; font-size: 0.9rem; color: var(--accent-dark); display: none; }
   h3 { margin-top: 0; color: var(--accent-dark); }
   #book-list { list-style: none; padding: 0; margin: 0; }
@@ -337,6 +416,15 @@ HTML_PAGE = """
   #viewer .nav button { width: auto; padding: 8px 18px; margin-top: 0; }
   #viewer .counter { color: var(--muted); font-size: 0.85rem; }
   #viewer .book-title { font-size: 1.3rem; color: var(--accent-dark); margin-bottom: 4px; }
+  .download-link {
+    display: block;
+    text-align: center;
+    margin-top: 16px;
+    color: var(--accent-dark);
+    font-weight: 600;
+    text-decoration: none;
+  }
+  .download-link:hover { text-decoration: underline; }
   .moral-page { font-style: italic; }
   .img-failed { padding: 40px 10px; color: var(--muted); border: 1px dashed var(--border); border-radius: 10px; }
 </style>
@@ -349,6 +437,7 @@ HTML_PAGE = """
 <div class="layout">
   <div class="panel" id="form-panel">
     <h3>New Book</h3>
+    <button type="button" id="randomize-btn" class="secondary-btn">Randomize Inputs</button>
     <form id="book-form">
       <label>Character name</label>
       <input type="text" name="character_name" required placeholder="e.g. Pip">
@@ -426,6 +515,7 @@ HTML_PAGE = """
         <span class="counter" id="v-counter"></span>
         <button id="v-next" type="button">Next &rarr;</button>
       </div>
+      <a id="v-download" class="download-link" href="#" download>Download as PDF</a>
     </div>
   </div>
 </div>
@@ -433,6 +523,80 @@ HTML_PAGE = """
 <script>
 let currentBook = null;
 let currentPage = 0;
+
+const RANDOM_POOL = {
+  character_name: ['Pip', 'Luna', 'Milo', 'Bramble', 'Sage', 'Nimbus', 'Coco', 'Ziggy', 'Clementine', 'Otto'],
+  character_description: [
+    'a small orange fox with a blue scarf and round glasses',
+    'a fluffy white rabbit with oversized ears and a polka-dot bowtie',
+    'a curious blue-feathered owl with tiny spectacles',
+    'a shy purple dragon with speckled wings',
+    'a bold green turtle with a tiny backpack',
+    'a sleepy gray koala who wears a knitted hat',
+    'a clever red panda with a striped scarf',
+    'a tiny yellow duckling with red rain boots',
+  ],
+  art_style: [
+    'soft watercolor storybook',
+    'bold flat-color cartoon',
+    'pastel pencil sketch',
+    'cut-paper collage',
+    'whimsical crayon doodle',
+    'claymation-style stop-motion look',
+    'retro 1960s picture book',
+    'dreamy pastel chalk',
+  ],
+  moral: [
+    "it's okay to ask for help",
+    'kindness always comes back around',
+    'mistakes are how we learn',
+    'sharing makes everything better',
+    'being different is something to celebrate',
+    'slow and steady wins the day',
+    'true friends stick together',
+    "it's brave to try new things",
+  ],
+  setting: [
+    'a quiet forest village',
+    'a floating city in the clouds',
+    'an underwater coral kingdom',
+    'a cozy treehouse town',
+    'a desert oasis full of surprises',
+    'a snow-covered mountain village',
+    'a bustling city park',
+    'a magical library between the shelves',
+  ],
+  age_range: ['', 'toddler (2-4)', 'early reader (5-7)', 'middle grade (8-10)'],
+  supporting_characters: [
+    '',
+    'a wise old owl',
+    'a mischievous younger sibling',
+    'a loyal best friend',
+    'a grumpy but kind neighbor',
+    'a talking compass',
+  ],
+  tone: ['', 'silly and playful', 'gentle and heartwarming', 'adventurous', 'spooky-but-safe'],
+};
+
+function pickRandom(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function randomizeForm() {
+  const form = document.getElementById('book-form');
+  form.character_name.value = pickRandom(RANDOM_POOL.character_name);
+  form.character_description.value = pickRandom(RANDOM_POOL.character_description);
+  form.art_style.value = pickRandom(RANDOM_POOL.art_style);
+  form.moral.value = pickRandom(RANDOM_POOL.moral);
+  form.setting.value = pickRandom(RANDOM_POOL.setting);
+  form.age_range.value = pickRandom(RANDOM_POOL.age_range);
+  form.supporting_characters.value = pickRandom(RANDOM_POOL.supporting_characters);
+  form.tone.value = pickRandom(RANDOM_POOL.tone);
+  form.num_pages.value = 4 + Math.floor(Math.random() * 7); // 4-10
+  form.rhyming.checked = Math.random() < 0.5;
+}
+
+document.getElementById('randomize-btn').addEventListener('click', randomizeForm);
 
 async function loadBooks() {
   const resp = await fetch('books');
@@ -462,6 +626,7 @@ function showViewer(book) {
   currentPage = 0;
   document.getElementById('viewer').style.display = 'block';
   document.getElementById('v-title').textContent = book.title;
+  document.getElementById('v-download').href = 'books/' + book.book_id + '/download';
   renderPage();
 }
 
